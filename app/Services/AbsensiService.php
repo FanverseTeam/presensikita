@@ -10,6 +10,7 @@ use App\Models\Kelas;
 use App\Models\KeterlambatanSiswa;
 use App\Models\Siswa;
 use App\Models\TahunAjaran;
+use App\Services\HariKhususService;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
 
@@ -469,11 +470,23 @@ class AbsensiService
             return;
         }
 
+        // Cek apakah tanggal ini merupakan Hari Khusus (Event / Pulang Cepat) untuk tingkat kelas ini
+        $kelas = Kelas::find($kelasId);
+        $tingkat = $kelas ? HariKhususService::normalizeTingkat($kelas->tingkat_kelas ?? $kelas->nama_kelas) : null;
+        $hariKhusus = HariKhususService::getHariKhusus($tanggal, $tingkat);
+
+        // Jika hari ini diliburkan untuk tingkat ini, jangan sinkronkan presensi / buat jurnal
+        if ($hariKhusus && $hariKhusus->tipe === 'event' && $hariKhusus->aturan_presensi === 'diliburkan') {
+            return;
+        }
+
         $isPastDate = ($tanggal < now()->toDateString());
         $isToday = ($tanggal === now()->toDateString());
         $nowTime = now()->format('H:i:s');
+        $isEventHadir = $hariKhusus && $hariKhusus->tipe === 'event' && $hariKhusus->aturan_presensi === 'hadir_event';
 
         $dispenList = DispenSiswa::whereIn('id_siswa', $allSiswa->pluck('id_siswa'))
+<<<<<<< HEAD
             ->where(function ($q) use ($tanggal) {
                 $q->where(function ($d) use ($tanggal) {
                     $d->where('jenis_absen', 'D')
@@ -489,6 +502,12 @@ class AbsensiService
                           })->orWhereDate('tanggal_selesai', '>=', $tanggal);
                       });
                 });
+=======
+            ->whereDate('tanggal_dispen', $tanggal)
+            ->where(function ($q) {
+                $q->where('status_waka', 'disetujui')
+                    ->orWhereIn('jenis_absen', ['S', 'I']);
+>>>>>>> 4a0c083 (Bug fix)
             })
             ->get();
 
@@ -507,15 +526,41 @@ class AbsensiService
             ->keyBy('id_jadwal');
 
         foreach ($jadwalList as $j) {
-            $isUpcoming = $isToday && ($nowTime < $j->jam_mulai);
-            if ($isUpcoming) {
-                // Jam belum dimulai hari ini, jangan sinkronkan
+            // Jika jam ini ditiadakan karena Pulang Cepat, lewati
+            if ($hariKhusus && HariKhususService::isJamPelajaranDitiadakan($tanggal, $tingkat, $j->jam_mulai)) {
                 continue;
+            }
+
+            // Pada hari event hadir otomatis, proses seluruh jam jadwal agar seluruh siswa otomatis hadir
+            if (! $isEventHadir) {
+                $isUpcoming = $isToday && ($nowTime < $j->jam_mulai);
+                if ($isUpcoming) {
+                    // Jam belum dimulai hari ini, jangan sinkronkan
+                    continue;
+                }
             }
 
             $jurnal = $jurnalsHariIni->get($j->id_jadwal);
 
-            // Auto-Hadir: jam sudah dimulai/selesai tapi belum ada jurnal.
+            // 1. Auto-Hadir Event: pada hari event dengan aturan hadir_event, buat jurnal otomatis jika belum ada
+            if ($isEventHadir && ! $jurnal) {
+                $autoEvent = JurnalKelas::create([
+                    'id_jadwal' => $j->id_jadwal,
+                    'id_guru' => $j->id_guru,
+                    'tanggal' => $tanggal,
+                    'status_kehadiran_guru' => 'Hadir',
+                    'foto_selfie' => null,
+                    'tanda_tangan' => null,
+                    'materi' => 'Kegiatan Event: ' . $hariKhusus->judul,
+                    'jumlah_hadir' => $totalSiswa,
+                    'waktu_input' => now(),
+                ]);
+
+                $jurnalsHariIni->put($j->id_jadwal, $autoEvent);
+                $jurnal = $autoEvent;
+            }
+
+            // 2. Auto-Hadir biasa: jam sudah dimulai/selesai tapi belum ada jurnal.
             // Jika guru pengampu sudah submit jurnal lain hari ini untuk kelas yang sama,
             // buat jurnal otomatis (semua siswa Hadir, salin materi dari jurnal sebelumnya).
             if (! $jurnal && $j->id_guru) {
@@ -550,6 +595,7 @@ class AbsensiService
             if ($jurnal) {
                 $normalizedJamKe = $j->jam_ke >= 100 ? $j->jam_ke - 100 : $j->jam_ke;
 
+<<<<<<< HEAD
                 // Tambahkan data dispen / surat sakit / izin aktif ke jurnal ini
                 foreach ($dispenList as $d) {
                     if ($d->jenis_absen === 'D') {
@@ -565,6 +611,24 @@ class AbsensiService
                     } else {
                         // S (Sakit) atau I (Izin) berlaku sepanjang hari
                         $st = $d->jenis_absen;
+=======
+                // Pada hari event hadir otomatis: hapus catatan Alpha ('A') lama karena seluruh siswa hadir secara default
+                if ($isEventHadir) {
+                    JurnalSiswaTidakHadir::where('id_jurnal', $jurnal->id_jurnal)
+                        ->where('status', 'A')
+                        ->forceDelete();
+                }
+
+                // Tambahkan data dispen / sakit / izin dari Guru Piket (Absensi Harian)
+                foreach ($dispenList as $d) {
+                    $st = $d->jenis_absen ?? 'D';
+                    $isSakitOrIzin = in_array($st, ['S', 'I']);
+                    $wMulai = $d->waktu_keluar ? $d->waktu_keluar->format('H:i:s') : ($d->created_at ? $d->created_at->format('H:i:s') : '00:00:00');
+                    $wSelesai = $d->waktu_masuk ? $d->waktu_masuk->format('H:i:s') : '23:59:59';
+
+                    // Sakit dan Izin berlaku penuh seharian (seluruh jam), dispensasi (D) dicek rentang jamnya
+                    if ($isSakitOrIzin || ($j->jam_selesai > $wMulai && $j->jam_mulai < $wSelesai)) {
+>>>>>>> 4a0c083 (Bug fix)
                         JurnalSiswaTidakHadir::updateOrCreate(
                             ['id_jurnal' => $jurnal->id_jurnal, 'id_siswa' => $d->id_siswa],
                             ['status' => $st, 'keterangan' => strtoupper($st).($d->alasan ? ': '.$d->alasan : '')]
@@ -572,23 +636,25 @@ class AbsensiService
                     }
                 }
 
-                // Sinkronisasi data keterlambatan siswa
-                foreach ($keterlambatanList as $k) {
-                    $targetJamKe = (int) $k->jam_ke;
-                    $th = JurnalSiswaTidakHadir::where('id_jurnal', $jurnal->id_jurnal)->where('id_siswa', $k->id_siswa)->first();
+                // Sinkronisasi data keterlambatan siswa (hanya jika bukan hari event)
+                if (! $isEventHadir) {
+                    foreach ($keterlambatanList as $k) {
+                        $targetJamKe = (int) $k->jam_ke;
+                        $th = JurnalSiswaTidakHadir::where('id_jurnal', $jurnal->id_jurnal)->where('id_siswa', $k->id_siswa)->first();
 
-                    if ($normalizedJamKe < $targetJamKe) {
-                        // Jam sebelum siswa hadir: jika Alpha atau belum tercatat, ubah jadi 'T'
-                        if ($th && $th->status === 'A') {
-                            $th->update([
-                                'status' => 'T',
-                                'keterangan' => 'Masuk Terlambat'.($k->alasan ? ': '.$k->alasan : ''),
-                            ]);
-                        }
-                    } else {
-                        // Jam saat/setelah siswa hadir: jika sebelumnya Alpha, hapus dan jadikan Hadir
-                        if ($th && $th->status === 'A') {
-                            $th->forceDelete();
+                        if ($normalizedJamKe < $targetJamKe) {
+                            // Jam sebelum siswa hadir: jika Alpha atau belum tercatat, ubah jadi 'T'
+                            if ($th && $th->status === 'A') {
+                                $th->update([
+                                    'status' => 'T',
+                                    'keterangan' => 'Masuk Terlambat'.($k->alasan ? ': '.$k->alasan : ''),
+                                ]);
+                            }
+                        } else {
+                            // Jam saat/setelah siswa hadir: jika sebelumnya Alpha, hapus dan jadikan Hadir
+                            if ($th && $th->status === 'A') {
+                                $th->forceDelete();
+                            }
                         }
                     }
                 }
@@ -598,6 +664,45 @@ class AbsensiService
                     'jumlah_hadir' => max(0, $totalSiswa - $countTidakHadir),
                 ]);
             }
+        }
+    }
+
+    /**
+     * Sinkronisasi otomatis jurnal hadir event untuk seluruh kelas yang terdampak.
+     */
+    public function syncEventHadir(\App\Models\HariKhusus $hariKhusus): void
+    {
+        if ($hariKhusus->tipe !== 'event' || $hariKhusus->aturan_presensi !== 'hadir_event') {
+            return;
+        }
+
+        $tglMulai = Carbon::parse($hariKhusus->tanggal_mulai);
+        $tglSelesai = Carbon::parse($hariKhusus->tanggal_selesai);
+        $today = now()->toDateString();
+
+        $tingkatList = array_map('intval', $hariKhusus->tingkat ?? []);
+        if (empty($tingkatList)) {
+            return;
+        }
+
+        $kelases = Kelas::where(function ($q) use ($tingkatList) {
+            foreach ($tingkatList as $t) {
+                $q->orWhere('nama_kelas', 'LIKE', $t . ' %')
+                    ->orWhere('nama_kelas', 'LIKE', $t . '-%')
+                    ->orWhere('tingkat_kelas', (string) $t)
+                    ->orWhere('tingkat_kelas', $t === 10 ? 'X' : ($t === 11 ? 'XI' : 'XII'));
+            }
+        })->get();
+
+        $curr = $tglMulai->copy();
+        while ($curr->lte($tglSelesai)) {
+            $curDateStr = $curr->toDateString();
+            if ($curDateStr <= $today) {
+                foreach ($kelases as $kelas) {
+                    $this->syncPresensiPerJam($kelas->id_kelas, $curDateStr);
+                }
+            }
+            $curr->addDay();
         }
     }
 }
